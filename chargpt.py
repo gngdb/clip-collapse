@@ -34,7 +34,7 @@ def get_config():
     C.model.model_type = 'gpt-mini'
     C.model.clip_token = C.data.clip_token
     C.model.clip_dim = 512
-    C.model.block_size = 128
+    C.model.block_size = 512
 
     # trainer
     C.trainer = Trainer.get_default_config()
@@ -52,7 +52,7 @@ class CharDataset(Dataset):
     @staticmethod
     def get_default_config():
         C = CN()
-        C.block_size = 256
+        C.block_size = 4096
         return C
 
     def __init__(self, config, data):
@@ -89,6 +89,8 @@ class CharDataset(Dataset):
 # -----------------------------------------------------------------------------
 
 if __name__ == '__main__':
+    import wandb
+    wandb.init(project="clip-gpt")
 
     # get default config and overrides from the command line, if any
     config = get_config()
@@ -110,9 +112,9 @@ if __name__ == '__main__':
 
     # iteration callback
     def batch_end_callback(trainer):
-
         if trainer.iter_num % 10 == 0:
             print(f"iter_dt {trainer.iter_dt * 1000:.2f}ms; iter {trainer.iter_num}: train loss {trainer.loss.item():.5f}")
+        wandb.log({'loss': trainer.loss.item(), 'iter': trainer.iter_num, 'iter_dt': trainer.iter_dt})
 
         if trainer.iter_num % 500 == 0:
             # evaluate both the train and test score
@@ -128,7 +130,8 @@ if __name__ == '__main__':
             # save the latest model
             print("saving model")
             ckpt_path = os.path.join(config.system.work_dir, "model.pt")
-            torch.save(model.state_dict(), ckpt_path)
+            state_dict = {k:v for k, v in model.state_dict().items() if 'clip_model' not in k}
+            torch.save(state_dict, ckpt_path)
             # revert model to training mode
             model.train()
 

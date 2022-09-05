@@ -113,27 +113,34 @@ class ClipCollapse(nn.Module):
         self.stoi = stoi
         assert 'κ' not in self.stoi, "κ is a reserved token for the CLIP model."
         self.stoi['κ'] = len(self.stoi)
-        self.max_clip_len = 32
+        self.min_clip_len = 32
+        self.max_clip_len = 128
 
     @torch.no_grad()
     def forward(self, x, y):
         import time
-        start = time.time()
+        class Timer:
+            def __init__(self):
+                self.start = time.time()
+            def __call__(self, msg):
+                #print(msg, time.time() - self.start)
+                self.start = time.time()
+        timer = Timer()
         device = x.device
         b, t = x.shape
         # convert the batch back into text
         text = []
         for tokens in x:
             text.append(''.join([self.itos[token.item()] for token in tokens]))
-        # print("untokenizing: ", time.time() - start)
-        _start = time.time()
+
+        timer("untokenizing: ")
         # replace random sub-strings with CLIP tokens
         clip_batch = []
         clipped_text = []
         clip_locs = []
         for t in text:
             clip_slices = [] # slices of the text that will be replaced with CLIP tokens
-            j = np.arange(len(t) - self.max_clip_len) # all possible start positions
+            j = np.arange(len(t) - self.min_clip_len) # all possible start positions
             slen = lambda x: (x.stop - x.start) - 1 # length of a slice
             while (len(t) - sum(slen(s) for s in clip_slices)) > self.config.block_size:
                 # sample new slices until we get one that doesn't overlap with the existing ones
@@ -141,14 +148,15 @@ class ClipCollapse(nn.Module):
                 rightwards_slices = [s for s in clip_slices if s.start > start]
                 if len(rightwards_slices) > 0:
                     closest_slice = min(rightwards_slices, key=lambda s: abs(s.start - start))
-                    stop = min(start + np.random.randint(4, self.max_clip_len), closest_slice.start)
+                    stop = min(start + np.random.randint(self.min_clip_len, self.max_clip_len), closest_slice.start)
                 else:
-                    stop = start + np.random.randint(4, self.max_clip_len)
+                    stop = start + np.random.randint(self.min_clip_len, self.max_clip_len)
+                stop = min(stop, len(t))
                 s = slice(start, stop)
                 # it would be nice to have a non-stochastic option here
                 assert not any (s.start < s2.stop and s2.start < s.stop for s2 in clip_slices), s
                 clip_slices.append(s)
-                j = j[np.logical_or(j < s.start - 4, j > s.stop + 4)]
+                j = j[np.logical_or(j < s.start, j >= s.stop)]
             inferred_len = len(t) - sum(slen(s) for s in clip_slices)
             # cut out clip slices (as long as you start with the last one this is fine)
             clip_chunks = [t[s] for s in clip_slices]
@@ -158,12 +166,12 @@ class ClipCollapse(nn.Module):
             assert len(t) == inferred_len, (len(t), inferred_len)
             clipped_text.append(t)
             clip_batch.append(clip_chunks)
-        # print("clipping: ", time.time() - _start)
+        timer("clipping: ")
         start = time.time()
         # process all the text through CLIP
         text_tokens = clip.tokenize([c for chunks in clip_batch for c in chunks]).to(device)
         text_features = self.clip_model.encode_text(text_tokens)
-        # print("encoding text: ", time.time() - start)
+        timer("encoding text: ")
         start = time.time()
         # rebuild the batch padding at the end where necessary
         ids = []
@@ -175,7 +183,7 @@ class ClipCollapse(nn.Module):
             assert len(i) == self.config.block_size, f"{len(i)} != {self.config.block_size}"
             ids.append(torch.tensor(i))
         ids = torch.stack(ids).to(device)
-        #print("tokenizing: ", time.time() - start)
+        timer("tokenizing: ")
         start = time.time()
         # create a mask where the CLIP tokens are
         mask = ids == self.stoi['κ']
@@ -185,7 +193,7 @@ class ClipCollapse(nn.Module):
         clip_embd = torch.zeros(b*t, f).to(device=device)
         clip_embd[clip_locs] = text_features.float()
         clip_embd = clip_embd.view(b, t, f)
-        #print("embedding: ", time.time() - start)
+        timer("embedding: ")
         # if targets are there, produce an output mask
         output_mask, y_ids = None, None
         if y is not None:
