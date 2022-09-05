@@ -27,7 +27,6 @@ def get_config():
 
     # data
     C.data = CharDataset.get_default_config()
-    C.data.clip_token = 1000000
 
     # model
     C.model = GPT.get_default_config()
