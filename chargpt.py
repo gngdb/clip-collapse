@@ -34,6 +34,7 @@ def get_config():
     C.model.model_type = 'gpt-mini'
     C.model.clip_token = C.data.clip_token
     C.model.clip_dim = 512
+    C.model.block_size = 128
 
     # trainer
     C.trainer = Trainer.get_default_config()
@@ -51,7 +52,7 @@ class CharDataset(Dataset):
     @staticmethod
     def get_default_config():
         C = CN()
-        C.block_size = 128
+        C.block_size = 256
         return C
 
     def __init__(self, config, data):
@@ -85,37 +86,6 @@ class CharDataset(Dataset):
         y = torch.tensor(dix[1:], dtype=torch.long)
         return x, y
 
-class ContrastiveCharDataset(CharDataset):
-    def __init__(self, config, data):
-        super().__init__(config, data)
-        self.device = "cpu"
-        self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
-        self.model.eval()
-        self.model.requires_grad_(False)
-        self.stoi['<clip>'] = config.clip_token
-
-    @torch.no_grad()
-    def __getitem__(self, idx):
-        # sample an integer to decide how long the clip encoded text should be
-        clip_length = torch.randint(4, self.config.block_size//10, (1,)).item()
-        # grab a chunk of (block_size - 1 + clip_length + 1) characters from the data
-        chunk = self.data[idx:idx + self.config.block_size + clip_length]
-        # choose random location to cut out clip from chunk
-        clip_start = torch.randint(0, self.config.block_size, (1,)).item()
-        clip_end = clip_start + clip_length
-        clip_chunk = chunk[clip_start:clip_end]
-        # encode clip chunk using clip text model
-        tokens = clip.tokenize(clip_chunk).to(self.device)
-        clip_encoding = self.model.encode_text(tokens)
-        # encode every character to an integer
-        dix = [self.stoi[s] for s in chunk[:clip_start]]
-        dix.append(self.stoi['<clip>'])
-        dix.extend([self.stoi[s] for s in chunk[clip_end:]])
-        # return as tensors
-        x = torch.tensor(dix[:-1], dtype=torch.long)
-        y = torch.tensor(dix[1:], dtype=torch.long)
-        return x, y, clip_encoding.detach().clone()
-
 # -----------------------------------------------------------------------------
 
 if __name__ == '__main__':
@@ -129,13 +99,11 @@ if __name__ == '__main__':
 
     # construct the training dataset
     text = open('input.txt', 'r').read() # don't worry we won't run out of file handles
-    train_dataset = ContrastiveCharDataset(config.data, text)
-    train_dataset[0]
+    train_dataset = CharDataset(config.data, text)
 
     # construct the model
-    config.model.vocab_size = train_dataset.get_vocab_size()
-    config.model.block_size = train_dataset.get_block_size()
-    model = GPT(config.model)
+    config.model.vocab_size = train_dataset.get_vocab_size() + 1
+    model = GPT(config.model, train_dataset.itos, train_dataset.stoi)
 
     # construct the trainer object
     trainer = Trainer(config.trainer, model, train_dataset)
@@ -149,13 +117,14 @@ if __name__ == '__main__':
         if trainer.iter_num % 500 == 0:
             # evaluate both the train and test score
             model.eval()
-            with torch.no_grad():
-                # sample from the model...
-                context = "O God, O God!"
-                x = torch.tensor([train_dataset.stoi[s] for s in context], dtype=torch.long)[None,...].to(trainer.device)
-                y = model.generate(x, 500, temperature=1.0, do_sample=True, top_k=10)[0]
-                completion = ''.join([train_dataset.itos[int(i)] for i in y])
-                print(completion)
+            if False:
+                with torch.no_grad():
+                    # sample from the model...
+                    context = "O God, O God!"
+                    x = torch.tensor([train_dataset.stoi[s] for s in context], dtype=torch.long)[None,...].to(trainer.device)
+                    y = model.generate(x, 500, temperature=1.0, do_sample=True, top_k=10)[0]
+                    completion = ''.join([train_dataset.itos[int(i)] for i in y])
+                    print(completion)
             # save the latest model
             print("saving model")
             ckpt_path = os.path.join(config.system.work_dir, "model.pt")

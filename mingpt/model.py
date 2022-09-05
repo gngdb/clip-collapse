@@ -9,6 +9,9 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
+import random
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -16,6 +19,8 @@ from torch.nn import functional as F
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
+
+import clip
 
 from mingpt.utils import CfgNode as CN
 
@@ -95,30 +100,98 @@ class Block(nn.Module):
         x = x + self.mlpf(self.ln_2(x))
         return x
 
-class CosineLogits(nn.Module):
-    """ cosine similarity between the last hidden state and the embedding matrix """
+class ClipCollapse(nn.Module):
+    """ Take a larger block size and collapse it stochastically to a smaller block size using CLIP. """
 
-    def __init__(self, n_embd, vocab_size):
+    def __init__(self, config, itos, stoi):
         super().__init__()
-        # bias term for the logits
-        #self.bias = nn.Parameter(torch.zeros(vocab_size))
-        # temperature term for the logits
-        self.temp = nn.Parameter(torch.zeros(vocab_size))
-        # projection matrix for the last hidden state
-        self.hproj = nn.Linear(n_embd, vocab_size, bias=False)
-        # projection matrix for the embedding matrix
-        self.eproj = nn.Linear(n_embd, vocab_size, bias=False)
+        self.config = config
+        self.clip_model, _ = clip.load("ViT-B/32")
+        self.clip_model.eval()
+        self.clip_model.requires_grad_(False)
+        self.itos = itos
+        self.stoi = stoi
+        assert 'κ' not in self.stoi, "κ is a reserved token for the CLIP model."
+        self.stoi['κ'] = len(self.stoi)
+        self.max_clip_len = 32
 
-    def forward(self, wte_weight, x):
-        # x is the last hidden state of the model
-        # wte_weight is the embedding matrix
-        vocab_size, embd_size = wte_weight.shape
-        wte_weight = rearrange(self.eproj(wte_weight), 'v e -> () () e v')
-        x = rearrange(self.hproj(x), 'b t e -> b t e ()')
-        x = F.normalize(x, dim=-2)
-        wte_weight = F.normalize(wte_weight, dim=-2)
-        logits = torch.einsum('b t e v, b t e v -> b t v', x, wte_weight)
-        return logits*torch.exp(self.temp.view(1, 1, -1)) + self.bias.view(1, 1, -1)
+    @torch.no_grad()
+    def forward(self, x, y):
+        import time
+        start = time.time()
+        device = x.device
+        b, t = x.shape
+        # convert the batch back into text
+        text = []
+        for tokens in x:
+            text.append(''.join([self.itos[token.item()] for token in tokens]))
+        # print("untokenizing: ", time.time() - start)
+        _start = time.time()
+        # replace random sub-strings with CLIP tokens
+        clip_batch = []
+        clipped_text = []
+        clip_locs = []
+        for t in text:
+            clip_slices = [] # slices of the text that will be replaced with CLIP tokens
+            j = np.arange(len(t) - self.max_clip_len) # all possible start positions
+            slen = lambda x: (x.stop - x.start) - 1 # length of a slice
+            while (len(t) - sum(slen(s) for s in clip_slices)) > self.config.block_size:
+                # sample new slices until we get one that doesn't overlap with the existing ones
+                start = np.random.choice(j)
+                rightwards_slices = [s for s in clip_slices if s.start > start]
+                if len(rightwards_slices) > 0:
+                    closest_slice = min(rightwards_slices, key=lambda s: abs(s.start - start))
+                    stop = min(start + np.random.randint(4, self.max_clip_len), closest_slice.start)
+                else:
+                    stop = start + np.random.randint(4, self.max_clip_len)
+                s = slice(start, stop)
+                # it would be nice to have a non-stochastic option here
+                assert not any (s.start < s2.stop and s2.start < s.stop for s2 in clip_slices), s
+                clip_slices.append(s)
+                j = j[np.logical_or(j < s.start - 4, j > s.stop + 4)]
+            inferred_len = len(t) - sum(slen(s) for s in clip_slices)
+            # cut out clip slices (as long as you start with the last one this is fine)
+            clip_chunks = [t[s] for s in clip_slices]
+            for s in sorted(clip_slices, key=lambda x: x.start, reverse=True):
+                t = t[:s.start] + 'κ' + t[s.stop:]
+                clip_locs.append(s.start)
+            assert len(t) == inferred_len, (len(t), inferred_len)
+            clipped_text.append(t)
+            clip_batch.append(clip_chunks)
+        # print("clipping: ", time.time() - _start)
+        start = time.time()
+        # process all the text through CLIP
+        text_tokens = clip.tokenize([c for chunks in clip_batch for c in chunks]).to(device)
+        text_features = self.clip_model.encode_text(text_tokens)
+        # print("encoding text: ", time.time() - start)
+        start = time.time()
+        # rebuild the batch padding at the end where necessary
+        ids = []
+        for t in clipped_text:
+            i = [self.stoi[c] for c in t]
+            d = len(i)
+            if d < self.config.block_size:
+                i += [self.stoi['κ']] * (self.config.block_size - d)
+            assert len(i) == self.config.block_size, f"{len(i)} != {self.config.block_size}"
+            ids.append(torch.tensor(i))
+        ids = torch.stack(ids).to(device)
+        #print("tokenizing: ", time.time() - start)
+        start = time.time()
+        # create a mask where the CLIP tokens are
+        mask = ids == self.stoi['κ']
+        # place the clip features into a tensor of the right shape
+        b, t = ids.shape
+        f = text_features.size(-1)
+        clip_embd = torch.zeros(b*t, f).to(device=device)
+        clip_embd[clip_locs] = text_features.float()
+        clip_embd = clip_embd.view(b, t, f)
+        #print("embedding: ", time.time() - start)
+        # if targets are there, produce an output mask
+        output_mask, y_ids = None, None
+        if y is not None:
+            output_mask = torch.cat([mask[:,1:], torch.zeros(b, 1, dtype=torch.bool, device=device)], dim=1)
+            y_ids = torch.cat([ids[:, 1:], y[:, [-1]]], dim=1)
+        return ids, y_ids, clip_embd, mask, output_mask
 
 class GPT(nn.Module):
     """ GPT Language Model """
@@ -140,7 +213,7 @@ class GPT(nn.Module):
         C.attn_pdrop = 0.1
         return C
 
-    def __init__(self, config):
+    def __init__(self, config, itos, stoi):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -177,9 +250,9 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
-        self.clip_proj = nn.Linear(config.clip_dim, config.n_embd)
+        self.clip_collapse = ClipCollapse(config, itos, stoi)
+        self.clip_proj = nn.Linear(config.clip_dim, config.n_embd, bias=False)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        #self.contrastive_head = CosineLogits(config.vocab_size)
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
@@ -259,6 +332,8 @@ class GPT(nn.Module):
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
+                if 'clip_collapse.clip_model' in fpn:
+                    continue
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way
                 # allows us to know which parent module any tensor p belongs to...
@@ -275,7 +350,7 @@ class GPT(nn.Module):
                     no_decay.add(fpn)
 
         # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in self.named_parameters() if 'clip_collapse.clip_model' not in pn}
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
@@ -290,21 +365,18 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets, clip_embedding):
+    def forward(self, idx, targets=None):
+        idx, targets, clip_embd, mask, output_mask = self.clip_collapse(idx, targets)
+
         device = idx.device
         b, t = idx.size()
-        x_clip_mask = idx == self.clip_token
-        y_clip_mask = targets == self.clip_token
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
-        if clip_embedding is None:
-            tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        else:
-            m = ~x_clip_mask
-            tok_emb = self.transformer.wte(idx*m)*m.unsqueeze(-1) # token embeddings of shape (b, t, n_embd)
-            tok_emb += self.clip_proj(clip_embedding)*x_clip_mask.unsqueeze(-1) # add the clip embedding to the token embeddings
+        m = ~mask
+        tok_emb = self.transformer.wte(idx*m)*m.unsqueeze(-1) # token embeddings of shape (b, t, n_embd)
+        tok_emb += self.clip_proj(clip_embd) # add the clip embedding to the token embeddings
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
@@ -316,14 +388,12 @@ class GPT(nn.Module):
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            m = ~y_clip_mask
+            m = ~output_mask
             #print("targets", targets.shape)
             #print("m", m.shape)
-            targets = targets*m
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
-            y_clip_mask = y_clip_mask.view(-1)
-            loss = loss*m.view(-1) # zero out the loss for the CLIP tokens
-            loss = loss.mean() # average the loss over the non-CLIP tokens
+            logits = logits[m]
+            targets = targets[m]
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         return logits, loss
 
@@ -334,6 +404,7 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        assert False
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
