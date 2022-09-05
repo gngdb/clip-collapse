@@ -3,3 +3,6 @@ __pycache__/
 *.swp
 .env
 .pylintrc
+
+input.txt
+out/

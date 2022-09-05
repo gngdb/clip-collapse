@@ -71,7 +71,7 @@ class Trainer:
             shuffle=False,
             pin_memory=True,
             batch_size=config.batch_size,
-            num_workers=config.num_workers,
+            num_workers=0
         )
 
         model.train()
@@ -87,10 +87,10 @@ class Trainer:
                 data_iter = iter(train_loader)
                 batch = next(data_iter)
             batch = [t.to(self.device) for t in batch]
-            x, y = batch
+            x, y, c = batch
 
             # forward the model
-            logits, self.loss = model(x, y)
+            logits, self.loss = model(x, y, c)
 
             # backprop and update the parameters
             model.zero_grad(set_to_none=True)

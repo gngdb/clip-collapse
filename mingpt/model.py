@@ -14,6 +14,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from einops import rearrange
+from einops.layers.torch import Rearrange
+
 from mingpt.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
@@ -92,6 +95,31 @@ class Block(nn.Module):
         x = x + self.mlpf(self.ln_2(x))
         return x
 
+class CosineLogits(nn.Module):
+    """ cosine similarity between the last hidden state and the embedding matrix """
+
+    def __init__(self, n_embd, vocab_size):
+        super().__init__()
+        # bias term for the logits
+        #self.bias = nn.Parameter(torch.zeros(vocab_size))
+        # temperature term for the logits
+        self.temp = nn.Parameter(torch.zeros(vocab_size))
+        # projection matrix for the last hidden state
+        self.hproj = nn.Linear(n_embd, vocab_size, bias=False)
+        # projection matrix for the embedding matrix
+        self.eproj = nn.Linear(n_embd, vocab_size, bias=False)
+
+    def forward(self, wte_weight, x):
+        # x is the last hidden state of the model
+        # wte_weight is the embedding matrix
+        vocab_size, embd_size = wte_weight.shape
+        wte_weight = rearrange(self.eproj(wte_weight), 'v e -> () () e v')
+        x = rearrange(self.hproj(x), 'b t e -> b t e ()')
+        x = F.normalize(x, dim=-2)
+        wte_weight = F.normalize(wte_weight, dim=-2)
+        logits = torch.einsum('b t e v, b t e v -> b t v', x, wte_weight)
+        return logits*torch.exp(self.temp.view(1, 1, -1)) + self.bias.view(1, 1, -1)
+
 class GPT(nn.Module):
     """ GPT Language Model """
 
@@ -117,6 +145,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
+        self.clip_token = config.clip_token
 
         type_given = config.model_type is not None
         params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
@@ -148,7 +177,9 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
+        self.clip_proj = nn.Linear(config.clip_dim, config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        #self.contrastive_head = CosineLogits(config.vocab_size)
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
@@ -224,7 +255,7 @@ class GPT(nn.Module):
         decay = set()
         no_decay = set()
         whitelist_weight_modules = (torch.nn.Linear, )
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, )
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
@@ -239,6 +270,8 @@ class GPT(nn.Module):
                     decay.add(fpn)
                 elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
                     # weights of blacklist modules will NOT be weight decayed
+                    no_decay.add(fpn)
+                elif pn.endswith('temp'):
                     no_decay.add(fpn)
 
         # validate that we considered every parameter
@@ -257,25 +290,40 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets, clip_embedding):
         device = idx.device
         b, t = idx.size()
+        x_clip_mask = idx == self.clip_token
+        y_clip_mask = targets == self.clip_token
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        if clip_embedding is None:
+            tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        else:
+            m = ~x_clip_mask
+            tok_emb = self.transformer.wte(idx*m)*m.unsqueeze(-1) # token embeddings of shape (b, t, n_embd)
+            tok_emb += self.clip_proj(clip_embedding)*x_clip_mask.unsqueeze(-1) # add the clip embedding to the token embeddings
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
+        #clogits = self.contrastive_head(self.transformer.wte.weight, x)
 
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            m = ~y_clip_mask
+            #print("targets", targets.shape)
+            #print("m", m.shape)
+            targets = targets*m
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
+            y_clip_mask = y_clip_mask.view(-1)
+            loss = loss*m.view(-1) # zero out the loss for the CLIP tokens
+            loss = loss.mean() # average the loss over the non-CLIP tokens
 
         return logits, loss
 
@@ -290,7 +338,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, None, None)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
